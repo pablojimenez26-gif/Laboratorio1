@@ -1,0 +1,202 @@
+# Definición de la red interna para que los contenedores se comuniquen por nombre
+networks:
+  bigdata-net:
+    driver: bridge
+
+# Definición de volúmenes para persistencia de datos
+volumes:
+  namenode_data:
+  datanode_data:
+  postgres_data:
+  mongo_data:
+  kafka_data:
+  zookeeper_data:
+  jupyter_workspace:
+  mysql_data:            # NUEVO: persistencia de MySQL
+
+services:
+  # ==========================================
+  # 1. HADOOP (HDFS)
+  # ==========================================
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-namenode
+    hostname: namenode
+    networks:
+      - bigdata-net
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_namenode_name_dir=/hadoop/dfs/name
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-datanode
+    networks:
+      - bigdata-net
+    depends_on:
+      - namenode
+    ports:
+      - "9864:9864"
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_datanode_data_dir=/hadoop/dfs/data
+
+  # ==========================================
+  # 2. APACHE SPARK
+  # ==========================================
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: spark-master
+    hostname: spark-master
+    networks:
+      - bigdata-net
+    ports:
+      - "8080:8080" # Web UI del Master
+      - "7077:7077" # Puerto de sumisión
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    networks:
+      - bigdata-net
+    depends_on:
+      - spark-master
+    ports:
+      - "8081:8081" # Web UI del Worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+
+  # ==========================================
+  # 3. KAFKA Y ZOOKEEPER
+  # ==========================================
+  zookeeper:
+    image: zookeeper:latest
+    container_name: zookeeper
+    networks:
+      - bigdata-net
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    networks:
+      - bigdata-net
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+  # ==========================================
+  # 4. BASES DE DATOS (MongoDB, PostgreSQL y MySQL)
+  # ==========================================
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    networks:
+      - bigdata-net
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    networks:
+      - bigdata-net
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin
+      - POSTGRES_DB=bigdata_db
+
+  # NUEVO: MySQL para el Laboratorio 1 (origen de Sqoop)
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-ventas
+    hostname: mysql
+    networks:
+      - bigdata-net
+    ports:
+      - "3306:3306"
+    # Plugin clásico de autenticación: compatible con el conector JDBC 5.1.x de Sqoop
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpass
+      - MYSQL_DATABASE=ventas_db
+      - MYSQL_USER=sqoopuser
+      - MYSQL_PASSWORD=sqooppassword
+
+  # ==========================================
+  # 5. JUPYTER NOTEBOOK (Anaconda)
+  # ==========================================
+  jupyter:
+    image: continuumio/anaconda3:latest
+    container_name: jupyter-lab
+    networks:
+      - bigdata-net
+    ports:
+      - "8888:8888"
+    volumes:
+      - jupyter_workspace:/opt/notebooks
+      - ./notebooks:/opt/notebooks/local # Mapea una carpeta local a Jupyter
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    # Instala las dependencias y arranca el servidor sin token para desarrollo local
+    command: >
+      bash -c "
+      pip install pyspark==3.5.1 kafka-python pymongo psycopg2-binary hdfs &&
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password='' --notebook-dir=/opt/notebooks
+      "
+
+  # ==========================================
+  # 6. INGESTA (Sqoop + Flume + cliente Hadoop)  <- NUEVO
+  # ==========================================
+  ingesta:
+    build: ./ingesta
+    container_name: ingesta
+    hostname: ingesta
+    networks:
+      - bigdata-net
+    depends_on:
+      - namenode
+      - datanode
+      - mysql
+    volumes:
+      # Edita weblogs.conf desde tu editor en el host; dentro aparece en ~/flume_configs
+      - ./flume_configs:/home/iabd_admin/flume_configs
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HADOOP_USER_NAME=root        # actúa como superusuario de HDFS (evita errores de permisos)
+    command: tail -f /dev/null       # se queda vivo; trabajas con: docker exec -it ingesta bash
